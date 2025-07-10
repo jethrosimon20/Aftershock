@@ -57,6 +57,68 @@
 
 (define-map authorized-verifiers principal bool)
 
+(define-data-var next-resource-id uint u1)
+(define-data-var next-allocation-id uint u1)
+
+(define-map registered-resources
+  uint
+  {
+    resource-owner: principal,
+    resource-type: (string-ascii 50),
+    resource-name: (string-ascii 100),
+    location: (string-ascii 100),
+    quantity: uint,
+    available-quantity: uint,
+    contact-info: (string-ascii 100),
+    last-updated: uint,
+    active: bool
+  }
+)
+
+(define-map resource-allocations
+  uint
+  {
+    resource-id: uint,
+    disaster-report-id: uint,
+    allocated-quantity: uint,
+    allocation-timestamp: uint,
+    allocation-status: (string-ascii 20),
+    priority-score: uint,
+    allocator: principal,
+    estimated-arrival: uint
+  }
+)
+
+(define-map resource-types-registry
+  (string-ascii 50)
+  {
+    total-registered: uint,
+    total-available: uint,
+    average-response-time: uint
+  }
+)
+
+(define-map location-resource-index
+  (string-ascii 100)
+  {
+    available-resources: uint,
+    last-allocation: uint,
+    resource-coverage-score: uint
+  }
+)
+
+(define-map disaster-resource-requests
+  uint
+  {
+    disaster-report-id: uint,
+    requested-resources: (list 10 (string-ascii 50)),
+    urgency-level: uint,
+    estimated-duration: uint,
+    request-timestamp: uint,
+    fulfilled: bool
+  }
+)
+
 (define-public (submit-disaster-report
   (disaster-type (string-ascii 50))
   (location (string-ascii 100))
@@ -190,6 +252,196 @@
   )
 )
 
+(define-public (register-resource
+  (resource-type (string-ascii 50))
+  (resource-name (string-ascii 100))
+  (location (string-ascii 100))
+  (quantity uint)
+  (contact-info (string-ascii 100))
+)
+  (let
+    (
+      (resource-id (var-get next-resource-id))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (asserts! (not (var-get contract-paused)) err-unauthorized)
+    (asserts! (> quantity u0) err-invalid-input)
+    (asserts! (> (len resource-type) u0) err-invalid-input)
+    (asserts! (> (len resource-name) u0) err-invalid-input)
+    (asserts! (> (len location) u0) err-invalid-input)
+    
+    (map-set registered-resources resource-id
+      {
+        resource-owner: tx-sender,
+        resource-type: resource-type,
+        resource-name: resource-name,
+        location: location,
+        quantity: quantity,
+        available-quantity: quantity,
+        contact-info: contact-info,
+        last-updated: current-time,
+        active: true
+      }
+    )
+    
+    (update-resource-type-registry resource-type quantity)
+    (update-location-resource-index location quantity)
+    
+    (var-set next-resource-id (+ resource-id u1))
+    (ok resource-id)
+  )
+)
+
+(define-public (update-resource-availability (resource-id uint) (new-available-quantity uint))
+  (let
+    (
+      (resource (unwrap! (map-get? registered-resources resource-id) err-not-found))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (asserts! (is-eq tx-sender (get resource-owner resource)) err-unauthorized)
+    (asserts! (<= new-available-quantity (get quantity resource)) err-invalid-input)
+    
+    (map-set registered-resources resource-id
+      (merge resource {
+        available-quantity: new-available-quantity,
+        last-updated: current-time
+      })
+    )
+    
+    (let
+      (
+        (quantity-diff (- (get available-quantity resource) new-available-quantity))
+      )
+      (update-resource-type-availability (get resource-type resource) quantity-diff)
+      (ok true)
+    )
+  )
+)
+
+(define-public (allocate-resource-to-disaster
+  (resource-id uint)
+  (disaster-report-id uint)
+  (allocated-quantity uint)
+  (estimated-arrival uint)
+)
+  (let
+    (
+      (resource (unwrap! (map-get? registered-resources resource-id) err-not-found))
+      (disaster-data (unwrap! (map-get? disaster-reports disaster-report-id) err-not-found))
+      (allocation-id (var-get next-allocation-id))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (priority-score (calculate-allocation-priority (get severity disaster-data) (get location disaster-data) (get location resource)))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get resource-owner resource))
+      (default-to false (map-get? authorized-verifiers tx-sender))
+      (is-eq tx-sender contract-owner)
+    ) err-unauthorized)
+    (asserts! (>= (get available-quantity resource) allocated-quantity) err-invalid-input)
+    (asserts! (> allocated-quantity u0) err-invalid-input)
+    
+    (map-set resource-allocations allocation-id
+      {
+        resource-id: resource-id,
+        disaster-report-id: disaster-report-id,
+        allocated-quantity: allocated-quantity,
+        allocation-timestamp: current-time,
+        allocation-status: "allocated",
+        priority-score: priority-score,
+        allocator: tx-sender,
+        estimated-arrival: estimated-arrival
+      }
+    )
+    
+    (map-set registered-resources resource-id
+      (merge resource {
+        available-quantity: (- (get available-quantity resource) allocated-quantity),
+        last-updated: current-time
+      })
+    )
+    
+    (var-set next-allocation-id (+ allocation-id u1))
+    (ok allocation-id)
+  )
+)
+
+(define-public (complete-resource-allocation (allocation-id uint))
+  (let
+    (
+      (allocation (unwrap! (map-get? resource-allocations allocation-id) err-not-found))
+      (resource (unwrap! (map-get? registered-resources (get resource-id allocation)) err-not-found))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get resource-owner resource))
+      (is-eq tx-sender (get allocator allocation))
+      (default-to false (map-get? authorized-verifiers tx-sender))
+    ) err-unauthorized)
+    (asserts! (is-eq (get allocation-status allocation) "allocated") err-invalid-input)
+    
+    (map-set resource-allocations allocation-id
+      (merge allocation { allocation-status: "completed" })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-resource-allocation (allocation-id uint))
+  (let
+    (
+      (allocation (unwrap! (map-get? resource-allocations allocation-id) err-not-found))
+      (resource (unwrap! (map-get? registered-resources (get resource-id allocation)) err-not-found))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get resource-owner resource))
+      (is-eq tx-sender (get allocator allocation))
+      (default-to false (map-get? authorized-verifiers tx-sender))
+    ) err-unauthorized)
+    (asserts! (is-eq (get allocation-status allocation) "allocated") err-invalid-input)
+    
+    (map-set resource-allocations allocation-id
+      (merge allocation { allocation-status: "cancelled" })
+    )
+    
+    (map-set registered-resources (get resource-id allocation)
+      (merge resource {
+        available-quantity: (+ (get available-quantity resource) (get allocated-quantity allocation))
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (request-disaster-resources
+  (disaster-report-id uint)
+  (requested-resources (list 10 (string-ascii 50)))
+  (urgency-level uint)
+  (estimated-duration uint)
+)
+  (let
+    (
+      (disaster-info (unwrap! (map-get? disaster-reports disaster-report-id) err-not-found))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get reporter disaster-info))
+      (default-to false (map-get? authorized-verifiers tx-sender))
+    ) err-unauthorized)
+    (asserts! (and (> urgency-level u0) (<= urgency-level u10)) err-invalid-input)
+    
+    (map-set disaster-resource-requests disaster-report-id
+      {
+        disaster-report-id: disaster-report-id,
+        requested-resources: requested-resources,
+        urgency-level: urgency-level,
+        estimated-duration: estimated-duration,
+        request-timestamp: current-time,
+        fulfilled: false
+      }
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-disaster-report (report-id uint))
   (map-get? disaster-reports report-id)
 )
@@ -224,6 +476,54 @@
 
 (define-read-only (get-reports-by-location (location (string-ascii 100)))
   (map-get? location-incidents location)
+)
+
+(define-read-only (get-registered-resource (resource-id uint))
+  (map-get? registered-resources resource-id)
+)
+
+(define-read-only (get-resource-allocation (allocation-id uint))
+  (map-get? resource-allocations allocation-id)
+)
+
+(define-read-only (get-resource-type-stats (resource-type (string-ascii 50)))
+  (map-get? resource-types-registry resource-type)
+)
+
+(define-read-only (get-location-resource-coverage (location (string-ascii 100)))
+  (map-get? location-resource-index location)
+)
+
+(define-read-only (get-disaster-resource-request (disaster-report-id uint))
+  (map-get? disaster-resource-requests disaster-report-id)
+)
+
+(define-read-only (get-next-resource-id)
+  (var-get next-resource-id)
+)
+
+(define-read-only (get-next-allocation-id)
+  (var-get next-allocation-id)
+)
+
+(define-read-only (calculate-resource-distance-score (resource-location (string-ascii 100)) (disaster-location (string-ascii 100)))
+  (if (is-eq resource-location disaster-location)
+    u100
+    (if (> (len resource-location) u0)
+      (let
+        (
+          (resource-len (len resource-location))
+          (disaster-len (len disaster-location))
+          (location-hash-diff (if (> resource-len disaster-len) (- resource-len disaster-len) (- disaster-len resource-len)))
+        )
+        (if (> location-hash-diff u50)
+          (- u100 location-hash-diff)
+          (+ u50 (- u50 location-hash-diff))
+        )
+      )
+      u0
+    )
+  )
 )
 
 (define-read-only (calculate-risk-score (location (string-ascii 100)))
@@ -310,6 +610,69 @@
       avg-severity: (/ new-severity-total new-total),
       total-damage: (+ (get total-damage current-stats) damage)
     })
+  )
+)
+
+(define-private (update-resource-type-registry (resource-type (string-ascii 50)) (quantity uint))
+  (let
+    (
+      (current-stats (default-to 
+        { total-registered: u0, total-available: u0, average-response-time: u0 }
+        (map-get? resource-types-registry resource-type)
+      ))
+    )
+    (map-set resource-types-registry resource-type {
+      total-registered: (+ (get total-registered current-stats) quantity),
+      total-available: (+ (get total-available current-stats) quantity),
+      average-response-time: (get average-response-time current-stats)
+    })
+  )
+)
+
+(define-private (update-resource-type-availability (resource-type (string-ascii 50)) (quantity-change uint))
+  (let
+    (
+      (current-stats (default-to 
+        { total-registered: u0, total-available: u0, average-response-time: u0 }
+        (map-get? resource-types-registry resource-type)
+      ))
+    )
+    (map-set resource-types-registry resource-type
+      (merge current-stats {
+        total-available: (if (>= (get total-available current-stats) quantity-change)
+          (- (get total-available current-stats) quantity-change)
+          u0)
+      })
+    )
+  )
+)
+
+(define-private (update-location-resource-index (location (string-ascii 100)) (quantity uint))
+  (let
+    (
+      (current-stats (default-to 
+        { available-resources: u0, last-allocation: u0, resource-coverage-score: u0 }
+        (map-get? location-resource-index location)
+      ))
+      (new-available (+ (get available-resources current-stats) quantity))
+      (coverage-score (if (> (+ (get resource-coverage-score current-stats) u10) u100) u100 (+ (get resource-coverage-score current-stats) u10)))
+    )
+    (map-set location-resource-index location {
+      available-resources: new-available,
+      last-allocation: (get last-allocation current-stats),
+      resource-coverage-score: coverage-score
+    })
+  )
+)
+
+(define-private (calculate-allocation-priority (severity uint) (disaster-location (string-ascii 100)) (resource-location (string-ascii 100)))
+  (let
+    (
+      (severity-weight (* severity u10))
+      (distance-score (calculate-resource-distance-score resource-location disaster-location))
+      (time-factor u20)
+    )
+    (+ severity-weight distance-score time-factor)
   )
 )
 ;; title: Aftershock
