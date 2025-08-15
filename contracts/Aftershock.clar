@@ -119,6 +119,81 @@
   }
 )
 
+;; Dynamic Risk Assessment & Alert System Maps
+(define-map risk-assessments
+  (string-ascii 100)
+  {
+    location: (string-ascii 100),
+    current-risk-level: uint,
+    historical-incidents: uint,
+    last-assessment: uint,
+    risk-trend: (string-ascii 20),
+    contributing-factors: (list 5 (string-ascii 50)),
+    predicted-disaster-types: (list 3 (string-ascii 50)),
+    confidence-score: uint
+  }
+)
+
+(define-map alert-configurations
+  (string-ascii 50)
+  {
+    alert-type: (string-ascii 50),
+    risk-threshold: uint,
+    auto-trigger: bool,
+    notification-radius: uint,
+    priority-level: uint,
+    resource-preposition-enabled: bool,
+    alert-frequency-limit: uint
+  }
+)
+
+(define-map active-alerts
+  uint
+  {
+    alert-id: uint,
+    location: (string-ascii 100),
+    alert-type: (string-ascii 50),
+    risk-level: uint,
+    triggered-at: uint,
+    status: (string-ascii 20),
+    affected-radius: uint,
+    recommended-actions: (list 5 (string-ascii 100)),
+    auto-triggered: bool,
+    acknowledged-by: (optional principal),
+    escalation-level: uint
+  }
+)
+
+(define-map risk-prediction-models
+  (string-ascii 50)
+  {
+    disaster-type: (string-ascii 50),
+    seasonal-factor: uint,
+    frequency-pattern: uint,
+    severity-multiplier: uint,
+    location-vulnerability: uint,
+    prediction-accuracy: uint,
+    last-updated: uint
+  }
+)
+
+(define-map location-risk-history
+  (string-ascii 100)
+  {
+    location: (string-ascii 100),
+    risk-timeline: (list 10 uint),
+    assessment-dates: (list 10 uint),
+    max-risk-recorded: uint,
+    risk-volatility: uint,
+    trend-direction: (string-ascii 20)
+  }
+)
+
+(define-data-var next-alert-id uint u1)
+(define-data-var global-risk-threshold uint u70)
+(define-data-var assessment-update-interval uint u86400) ;; 24 hours in seconds
+(define-data-var alert-cooldown-period uint u3600) ;; 1 hour cooldown
+
 (define-public (submit-disaster-report
   (disaster-type (string-ascii 50))
   (location (string-ascii 100))
@@ -442,6 +517,225 @@
   )
 )
 
+;; Dynamic Risk Assessment & Alert System Functions
+
+(define-public (configure-alert-type
+  (alert-type (string-ascii 50))
+  (risk-threshold uint)
+  (auto-trigger bool)
+  (notification-radius uint)
+  (priority-level uint)
+  (resource-preposition-enabled bool)
+  (alert-frequency-limit uint)
+)
+  (begin
+    (asserts! (or 
+      (is-eq tx-sender contract-owner)
+      (default-to false (map-get? authorized-verifiers tx-sender))
+    ) err-unauthorized)
+    (asserts! (and (> risk-threshold u0) (<= risk-threshold u100)) err-invalid-input)
+    (asserts! (and (> priority-level u0) (<= priority-level u5)) err-invalid-input)
+    
+    (map-set alert-configurations alert-type
+      {
+        alert-type: alert-type,
+        risk-threshold: risk-threshold,
+        auto-trigger: auto-trigger,
+        notification-radius: notification-radius,
+        priority-level: priority-level,
+        resource-preposition-enabled: resource-preposition-enabled,
+        alert-frequency-limit: alert-frequency-limit
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-risk-assessment
+  (location (string-ascii 100))
+  (contributing-factors (list 5 (string-ascii 50)))
+  (predicted-disaster-types (list 3 (string-ascii 50)))
+)
+  (let
+    (
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (location-stats (map-get? location-incidents location))
+      (calculated-risk (calculate-dynamic-risk-level location contributing-factors))
+      (risk-trend (determine-risk-trend location calculated-risk))
+      (confidence-score (calculate-confidence-score location predicted-disaster-types))
+    )
+    (asserts! (or 
+      (is-eq tx-sender contract-owner)
+      (default-to false (map-get? authorized-verifiers tx-sender))
+    ) err-unauthorized)
+    (asserts! (> (len location) u0) err-invalid-input)
+    
+    (begin
+      (map-set risk-assessments location
+        {
+          location: location,
+          current-risk-level: calculated-risk,
+          historical-incidents: (match location-stats stats (get incident-count stats) u0),
+          last-assessment: current-time,
+          risk-trend: risk-trend,
+          contributing-factors: contributing-factors,
+          predicted-disaster-types: predicted-disaster-types,
+          confidence-score: confidence-score
+        }
+      )
+      
+      (update-risk-history location calculated-risk current-time)
+      (unwrap! (check-and-trigger-alerts location calculated-risk) err-invalid-input)
+      (ok calculated-risk)
+    )
+  )
+)
+
+(define-public (trigger-manual-alert
+  (location (string-ascii 100))
+  (alert-type (string-ascii 50))
+  (risk-level uint)
+  (recommended-actions (list 5 (string-ascii 100)))
+)
+  (let
+    (
+      (alert-id (var-get next-alert-id))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (alert-config (map-get? alert-configurations alert-type))
+    )
+    (asserts! (or 
+      (is-eq tx-sender contract-owner)
+      (default-to false (map-get? authorized-verifiers tx-sender))
+    ) err-unauthorized)
+    (asserts! (and (> risk-level u0) (<= risk-level u100)) err-invalid-input)
+    (asserts! (> (len location) u0) err-invalid-input)
+    
+    (map-set active-alerts alert-id
+      {
+        alert-id: alert-id,
+        location: location,
+        alert-type: alert-type,
+        risk-level: risk-level,
+        triggered-at: current-time,
+        status: "active",
+        affected-radius: (match alert-config config (get notification-radius config) u0),
+        recommended-actions: recommended-actions,
+        auto-triggered: false,
+        acknowledged-by: none,
+        escalation-level: u1
+      }
+    )
+    
+    (var-set next-alert-id (+ alert-id u1))
+    (ok alert-id)
+  )
+)
+
+(define-public (acknowledge-alert (alert-id uint))
+  (let
+    (
+      (alert (unwrap! (map-get? active-alerts alert-id) err-not-found))
+    )
+    (asserts! (or 
+      (is-eq tx-sender contract-owner)
+      (default-to false (map-get? authorized-verifiers tx-sender))
+    ) err-unauthorized)
+    (asserts! (is-eq (get status alert) "active") err-invalid-input)
+    
+    (map-set active-alerts alert-id
+      (merge alert {
+        status: "acknowledged",
+        acknowledged-by: (some tx-sender)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (escalate-alert (alert-id uint))
+  (let
+    (
+      (alert (unwrap! (map-get? active-alerts alert-id) err-not-found))
+      (current-escalation (get escalation-level alert))
+    )
+    (asserts! (or 
+      (is-eq tx-sender contract-owner)
+      (default-to false (map-get? authorized-verifiers tx-sender))
+    ) err-unauthorized)
+    (asserts! (is-eq (get status alert) "active") err-invalid-input)
+    (asserts! (< current-escalation u5) err-invalid-input)
+    
+    (map-set active-alerts alert-id
+      (merge alert {
+        escalation-level: (+ current-escalation u1),
+        status: "escalated"
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-alert (alert-id uint))
+  (let
+    (
+      (alert (unwrap! (map-get? active-alerts alert-id) err-not-found))
+    )
+    (asserts! (or 
+      (is-eq tx-sender contract-owner)
+      (default-to false (map-get? authorized-verifiers tx-sender))
+    ) err-unauthorized)
+    
+    (map-set active-alerts alert-id
+      (merge alert { status: "resolved" })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-prediction-model
+  (disaster-type (string-ascii 50))
+  (seasonal-factor uint)
+  (frequency-pattern uint)
+  (severity-multiplier uint)
+  (location-vulnerability uint)
+)
+  (let
+    (
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (existing-model (map-get? risk-prediction-models disaster-type))
+      (accuracy-score (calculate-model-accuracy disaster-type))
+    )
+    (asserts! (or 
+      (is-eq tx-sender contract-owner)
+      (default-to false (map-get? authorized-verifiers tx-sender))
+    ) err-unauthorized)
+    (asserts! (and (> seasonal-factor u0) (<= seasonal-factor u100)) err-invalid-input)
+    (asserts! (and (> severity-multiplier u0) (<= severity-multiplier u200)) err-invalid-input)
+    
+    (map-set risk-prediction-models disaster-type
+      {
+        disaster-type: disaster-type,
+        seasonal-factor: seasonal-factor,
+        frequency-pattern: frequency-pattern,
+        severity-multiplier: severity-multiplier,
+        location-vulnerability: location-vulnerability,
+        prediction-accuracy: accuracy-score,
+        last-updated: current-time
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-global-risk-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (> new-threshold u0) (<= new-threshold u100)) err-invalid-input)
+    (var-set global-risk-threshold new-threshold)
+    (ok true)
+  )
+)
+
 (define-read-only (get-disaster-report (report-id uint))
   (map-get? disaster-reports report-id)
 )
@@ -504,6 +798,71 @@
 
 (define-read-only (get-next-allocation-id)
   (var-get next-allocation-id)
+)
+
+;; Dynamic Risk Assessment & Alert System Read-Only Functions
+
+(define-read-only (get-risk-assessment (location (string-ascii 100)))
+  (map-get? risk-assessments location)
+)
+
+(define-read-only (get-alert-configuration (alert-type (string-ascii 50)))
+  (map-get? alert-configurations alert-type)
+)
+
+(define-read-only (get-active-alert (alert-id uint))
+  (map-get? active-alerts alert-id)
+)
+
+(define-read-only (get-prediction-model (disaster-type (string-ascii 50)))
+  (map-get? risk-prediction-models disaster-type)
+)
+
+(define-read-only (get-location-risk-history (location (string-ascii 100)))
+  (map-get? location-risk-history location)
+)
+
+(define-read-only (get-global-risk-threshold)
+  (var-get global-risk-threshold)
+)
+
+(define-read-only (get-next-alert-id)
+  (var-get next-alert-id)
+)
+
+(define-read-only (calculate-location-risk-level (location (string-ascii 100)))
+  (let
+    (
+      (location-stats (map-get? location-incidents location))
+      (risk-assessment (map-get? risk-assessments location))
+    )
+    (match location-stats
+      stats
+      (let
+        (
+          (incident-count (get incident-count stats))
+          (avg-severity (if (> incident-count u0) 
+            (/ (get severity-total stats) incident-count) 
+            u0))
+          (time-factor (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+          (recency-factor (if (> (get last-incident stats) u0)
+            (if (< (- time-factor (get last-incident stats)) u2592000) u20 u0) ;; 30 days
+            u0))
+        )
+        (ok (+ (* incident-count u15) (* avg-severity u10) recency-factor))
+      )
+      (ok u0)
+    )
+  )
+)
+
+(define-read-only (get-high-risk-locations)
+  (let
+    (
+      (threshold (var-get global-risk-threshold))
+    )
+    (ok threshold)
+  )
 )
 
 (define-read-only (calculate-resource-distance-score (resource-location (string-ascii 100)) (disaster-location (string-ascii 100)))
@@ -675,32 +1034,205 @@
     (+ severity-weight distance-score time-factor)
   )
 )
-;; title: Aftershock
-;; version:
-;; summary:
-;; description:
 
-;; traits
-;;
+;; Dynamic Risk Assessment & Alert System Private Functions
 
-;; token definitions
-;;
+(define-private (calculate-dynamic-risk-level (location (string-ascii 100)) (contributing-factors (list 5 (string-ascii 50))))
+  (let
+    (
+      (location-stats (map-get? location-incidents location))
+      (base-risk (match location-stats 
+        stats 
+        (let
+          (
+            (incident-count (get incident-count stats))
+            (avg-severity (if (> incident-count u0) 
+              (/ (get severity-total stats) incident-count) 
+              u0))
+          )
+          (+ (* incident-count u5) (* avg-severity u8))
+        )
+        u0))
+      (factor-multiplier (calculate-factor-weight contributing-factors))
+    )
+    (let
+      (
+        (calculated-risk (+ base-risk factor-multiplier))
+      )
+      (if (> calculated-risk u100) u100 calculated-risk)
+    )
+  )
+)
 
-;; constants
-;;
+(define-private (calculate-factor-weight (factors (list 5 (string-ascii 50))))
+  (fold calculate-single-factor-weight factors u0)
+)
 
-;; data vars
-;;
+(define-private (calculate-single-factor-weight (factor (string-ascii 50)) (current-weight uint))
+  (let
+    (
+      (factor-value (if (is-eq factor "weather-extreme") u15
+        (if (is-eq factor "seismic-activity") u20
+        (if (is-eq factor "infrastructure-age") u10
+        (if (is-eq factor "population-density") u12
+        (if (is-eq factor "emergency-preparedness") u8
+        u5))))))
+    )
+    (+ current-weight factor-value)
+  )
+)
 
-;; data maps
-;;
+(define-private (determine-risk-trend (location (string-ascii 100)) (current-risk uint))
+  (let
+    (
+      (risk-history (map-get? location-risk-history location))
+    )
+    (match risk-history
+      history
+      (let
+        (
+          (risk-timeline (get risk-timeline history))
+          (last-risk (default-to u0 (element-at? risk-timeline u0)))
+        )
+        (if (> current-risk (+ last-risk u10))
+          "increasing"
+          (if (< current-risk (- last-risk u10))
+            "decreasing"
+            "stable"))
+      )
+      "new"
+    )
+  )
+)
 
-;; public functions
-;;
+(define-private (calculate-confidence-score (location (string-ascii 100)) (predicted-types (list 3 (string-ascii 50))))
+  (let
+    (
+      (location-stats (map-get? location-incidents location))
+      (base-confidence (match location-stats 
+        stats 
+        (let
+          (
+            (incident-count (get incident-count stats))
+          )
+          (if (> incident-count u10) u80
+          (if (> incident-count u5) u60
+          (if (> incident-count u1) u40
+          u20)))
+        )
+        u10))
+      (prediction-factor (len predicted-types))
+    )
+    (+ base-confidence (* prediction-factor u5))
+  )
+)
 
-;; read only functions
-;;
+(define-private (update-risk-history (location (string-ascii 100)) (risk-level uint) (timestamp uint))
+  (let
+    (
+      (existing-history (map-get? location-risk-history location))
+    )
+    (match existing-history
+      history
+      (let
+        (
+          (current-timeline (get risk-timeline history))
+          (current-dates (get assessment-dates history))
+          (new-timeline (unwrap-panic (as-max-len? (append current-timeline risk-level) u10)))
+          (new-dates (unwrap-panic (as-max-len? (append current-dates timestamp) u10)))
+          (max-risk (if (> risk-level (get max-risk-recorded history)) risk-level (get max-risk-recorded history)))
+        )
+        (map-set location-risk-history location {
+          location: location,
+          risk-timeline: new-timeline,
+          assessment-dates: new-dates,
+          max-risk-recorded: max-risk,
+          risk-volatility: (calculate-risk-volatility new-timeline),
+          trend-direction: (determine-risk-trend location risk-level)
+        })
+      )
+      (map-set location-risk-history location {
+        location: location,
+        risk-timeline: (list risk-level),
+        assessment-dates: (list timestamp),
+        max-risk-recorded: risk-level,
+        risk-volatility: u0,
+        trend-direction: "new"
+      })
+    )
+  )
+)
 
-;; private functions
-;;
+(define-private (calculate-risk-volatility (risk-timeline (list 10 uint)))
+  (if (> (len risk-timeline) u1)
+    (let
+      (
+        (first-risk (default-to u0 (element-at? risk-timeline u0)))
+        (last-risk (default-to u0 (element-at? risk-timeline (- (len risk-timeline) u1))))
+        (volatility (if (> first-risk last-risk) (- first-risk last-risk) (- last-risk first-risk)))
+      )
+      volatility
+    )
+    u0
+  )
+)
+
+(define-private (check-and-trigger-alerts (location (string-ascii 100)) (risk-level uint))
+  (let
+    (
+      (threshold (var-get global-risk-threshold))
+    )
+    (if (>= risk-level threshold)
+      (auto-trigger-alert location risk-level)
+      (ok false)
+    )
+  )
+)
+
+(define-private (auto-trigger-alert (location (string-ascii 100)) (risk-level uint))
+  (let
+    (
+      (alert-id (var-get next-alert-id))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (map-set active-alerts alert-id
+      {
+        alert-id: alert-id,
+        location: location,
+        alert-type: "high-risk-detected",
+        risk-level: risk-level,
+        triggered-at: current-time,
+        status: "active",
+        affected-radius: u0,
+        recommended-actions: (list "assess-situation" "prepare-resources" "notify-authorities"),
+        auto-triggered: true,
+        acknowledged-by: none,
+        escalation-level: u1
+      }
+    )
+    (var-set next-alert-id (+ alert-id u1))
+    (ok true)
+  )
+)
+
+(define-private (calculate-model-accuracy (disaster-type (string-ascii 50)))
+  (let
+    (
+      (disaster-stats (map-get? disaster-type-stats disaster-type))
+    )
+    (match disaster-stats
+      stats
+      (let
+        (
+          (total-incidents (get total-incidents stats))
+        )
+        (if (> total-incidents u20) u85
+        (if (> total-incidents u10) u70
+        (if (> total-incidents u5) u55
+        u40)))
+      )
+      u30
+    )
+  )
+)
 
